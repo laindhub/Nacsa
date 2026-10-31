@@ -4,167 +4,257 @@ import android.Manifest;
 import android.app.*;
 import android.content.*;
 import android.content.pm.PackageManager;
-import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.location.LocationManager;
 import android.media.projection.MediaProjectionManager;
+import android.net.wifi.p2p.WifiP2pDevice;
 import android.os.*;
+import android.provider.Settings;
 import android.text.InputType;
 import android.view.*;
 import android.widget.*;
-import java.net.*;
+import java.net.InetAddress;
 import java.security.SecureRandom;
 import java.util.*;
 
-public final class MainActivity extends Activity {
-  private static final int AUDIO_REQUEST=20, PROJECTION_REQUEST=21;
-  private static final int BG=0xff101618, PANEL=0xff1a2426, GREEN=0xff1ed760, WHITE=0xfff1f6f3, MUTED=0xffb2c2b9;
+public final class MainActivity extends Activity implements DirectLink.Listener {
+  private static final int REQ_AUDIO=20,REQ_PROJECTION=21,REQ_DIRECT=22;
+  private static final int BG=0xff101618,PANEL=0xff1a2426,GREEN=0xff1ed760,WHITE=0xfff1f6f3,MUTED=0xffb2c2b9;
   private boolean host=true;
-  private String pendingPin="";
-  private TextView status, signal;
-  private EditText ipField,pinField;
+  private String pendingPin="",pendingSpeakerPin="";
+  private int pendingBufferMs=120;
+  private boolean connectionPending=false;
+  private boolean groupOwnerReady=false;
+  private String directMessage="Conexión Wi-Fi Direct aún no iniciada";
+  private String hostStatus="Sin transmisión",speakerStatus="Sin conexión";
+  private TextView status,signal,directStatus;
+  private EditText pinField;
   private SeekBar delay;
+  private LinearLayout peerBox;
+  private List<WifiP2pDevice> nearby=new ArrayList<>();
+  private DirectLink direct;
   private BroadcastReceiver updates;
-  private String hostStatus="Preparado para transmitir", speakerStatus="Esperando al anfitrión";
+  private Runnable pendingPermissionAction;
 
-  @Override public void onCreate(Bundle b) {
-    super.onCreate(b);
+  @Override public void onCreate(Bundle state){
+    super.onCreate(state);
     host=!SpeakerService.active;
+    direct=new DirectLink(this,this);
     render();
   }
-  @Override protected void onStart() {
+  @Override protected void onStart(){
     super.onStart();
-    updates=new BroadcastReceiver() {
-      @Override public void onReceive(Context c,Intent i) {
-        String role=i.getStringExtra("role");
-        String message=i.getStringExtra("message");
-        if(message==null) return;
-        if("host".equals(role)) hostStatus=message;
-        if("speaker".equals(role)) speakerStatus=message;
-        if(status!=null) status.setText(host ? hostStatus : speakerStatus);
-        if(signal!=null && host) signal.setText("Señal capturada: "+HostService.level+"%   |   "+(HostService.connected?"Parlante conectado":"Sin invitado"));
+    direct.register();
+    updates=new BroadcastReceiver(){
+      @Override public void onReceive(Context c,Intent i){
+        String role=i.getStringExtra("role"),message=i.getStringExtra("message");
+        if(message==null)return;
+        if("host".equals(role))hostStatus=message;
+        if("speaker".equals(role))speakerStatus=message;
+        if(status!=null)status.setText(host?hostStatus:speakerStatus);
+        if(signal!=null)signal.setText("Señal: "+HostService.level+"% · "+(HostService.connected?"Parlante enlazado":"Sin invitado"));
       }
     };
     IntentFilter f=new IntentFilter(HostService.STATUS);
-    if(Build.VERSION.SDK_INT>=33) registerReceiver(updates,f,Context.RECEIVER_NOT_EXPORTED);
+    if(Build.VERSION.SDK_INT>=33)registerReceiver(updates,f,Context.RECEIVER_NOT_EXPORTED);
     else registerReceiver(updates,f);
+    if(allowedDirect())direct.refreshConnection();
   }
-  @Override protected void onStop() {
-    if(updates!=null){ unregisterReceiver(updates); updates=null; }
+  @Override protected void onStop(){
+    if(updates!=null){unregisterReceiver(updates);updates=null;}
+    direct.unregister();
     super.onStop();
   }
-  private int dp(int d){ return (int)(d*getResources().getDisplayMetrics().density+.5f); }
-  private GradientDrawable shape(int fill) {
-    GradientDrawable d=new GradientDrawable(); d.setColor(fill); d.setCornerRadius(dp(15)); return d;
+  private int dp(int n){return (int)(n*getResources().getDisplayMetrics().density+.5f);}
+  private GradientDrawable shape(int fill){
+    GradientDrawable d=new GradientDrawable();d.setColor(fill);d.setCornerRadius(dp(16));return d;
   }
-  private TextView txt(String value,int size,int color,boolean bold) {
-    TextView t=new TextView(this); t.setText(value);t.setTextColor(color);t.setTextSize(size);
-    if(bold) t.setTypeface(Typeface.DEFAULT,Typeface.BOLD);
+  private TextView text(String s,int size,int color,boolean bold){
+    TextView t=new TextView(this);t.setText(s);t.setTextSize(size);t.setTextColor(color);
+    if(bold)t.setTypeface(Typeface.DEFAULT,Typeface.BOLD);
     return t;
   }
-  private void add(LinearLayout parent,View child,int top) {
-    LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,-2);p.topMargin=dp(top);parent.addView(child,p);
+  private void add(LinearLayout parent,View child,int top){
+    LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,-2);p.topMargin=dp(top);
+    parent.addView(child,p);
   }
-  private TextView action(String name,boolean primary,Runnable f) {
-    TextView t=txt(name,16,primary?BG:WHITE,true);
-    t.setGravity(Gravity.CENTER);t.setPadding(dp(12),dp(17),dp(12),dp(17));
-    t.setBackground(shape(primary?GREEN:0xff324043));
-    t.setOnClickListener(v->f.run());return t;
+  private TextView button(String label,boolean primary,Runnable click){
+    TextView b=text(label,15,primary?BG:WHITE,true);
+    b.setGravity(Gravity.CENTER);b.setPadding(dp(12),dp(16),dp(12),dp(16));
+    b.setBackground(shape(primary?GREEN:0xff324043));
+    b.setOnClickListener(v->click.run());return b;
   }
-  private EditText field(String hint,String value,int type) {
-    EditText e=new EditText(this);e.setSingleLine(true);e.setHint(hint);e.setText(value);e.setTextSize(17);
-    e.setInputType(type);e.setTextColor(WHITE);e.setHintTextColor(0xff92a7a0);
-    e.setPadding(dp(14),dp(13),dp(14),dp(13));e.setBackground(shape(0xff0b1214));return e;
+  private EditText edit(String hint,String initial,int type){
+    EditText e=new EditText(this);e.setSingleLine(true);e.setText(initial);e.setHint(hint);
+    e.setInputType(type);e.setTextSize(17);e.setTextColor(WHITE);e.setHintTextColor(0xff92a7a0);
+    e.setPadding(dp(14),dp(13),dp(14),dp(13));e.setBackground(shape(0xff0b1214));
+    return e;
   }
-  private void render() {
-    ScrollView sc=new ScrollView(this);sc.setBackgroundColor(BG);sc.setFillViewport(true);
-    LinearLayout root=new LinearLayout(this);root.setOrientation(1);root.setPadding(dp(20),dp(38),dp(20),dp(34));
-    sc.addView(root);setContentView(sc);
-    add(root,txt("DUOLINK AUDIO",14,GREEN,true),0);
-    add(root,txt("Dos celulares, una canción.",26,WHITE,true),6);
-    add(root,txt("Sin Spotify Jam. El invitado solo recibe sonido por Wi-Fi.",14,MUTED,false),8);
-    LinearLayout roles=new LinearLayout(this);roles.setOrientation(0);
-    TextView a=action("Anfitrión",host,()->{host=true;render();});
-    TextView b=action("Parlante",!host,()->{host=false;render();});
-    LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(0,-2,1);
-    p.rightMargin=dp(5);roles.addView(a,p);
-    p=new LinearLayout.LayoutParams(0,-2,1);p.leftMargin=dp(5);roles.addView(b,p);
-    add(root,roles,22);
-    LinearLayout panel=new LinearLayout(this);panel.setOrientation(1);panel.setPadding(dp(17),dp(19),dp(17),dp(19));panel.setBackground(shape(PANEL));
-    add(root,panel,18);
-    if(host) showHost(panel); else showSpeaker(panel);
-    add(root,txt("COMPATIBILIDAD",12,GREEN,true),22);
-    add(root,txt("Captura únicamente el sonido que Android autoriza a compartir. Spotify puede bloquear su audio; en ese caso el anfitrión reproduce, pero el invitado recibe silencio.",13,MUTED,false),8);
+  private void render(){
+    ScrollView scroll=new ScrollView(this);scroll.setBackgroundColor(BG);scroll.setFillViewport(true);
+    LinearLayout root=new LinearLayout(this);root.setOrientation(1);root.setPadding(dp(20),dp(36),dp(20),dp(32));
+    scroll.addView(root);setContentView(scroll);
+    add(root,text("DUOLINK · DIRECT",13,GREEN,true),0);
+    add(root,text("Dos celulares. Sin router.",26,WHITE,true),6);
+    add(root,text("El segundo Android funciona como parlante cercano. No necesita Wi-Fi de casa ni una cuenta Spotify.",14,MUTED,false),9);
+    LinearLayout tabs=new LinearLayout(this);tabs.setOrientation(0);
+    TextView a=button("Anfitrión",host,()->{host=true;render();});
+    TextView b=button("Parlante",!host,()->{host=false;render();});
+    LinearLayout.LayoutParams left=new LinearLayout.LayoutParams(0,-2,1);left.rightMargin=dp(4);
+    LinearLayout.LayoutParams right=new LinearLayout.LayoutParams(0,-2,1);right.leftMargin=dp(4);
+    tabs.addView(a,left);tabs.addView(b,right);add(root,tabs,22);
+    LinearLayout card=new LinearLayout(this);card.setOrientation(1);card.setPadding(dp(16),dp(18),dp(16),dp(20));
+    card.setBackground(shape(PANEL));add(root,card,18);
+    if(host)hostUi(card);else speakerUi(card);
+    add(root,text("IMPORTANTE PARA VIAJES",12,GREEN,true),20);
+    add(root,text("Wi-Fi Direct funciona sin Internet. El anfitrión puede reproducir música descargada; usar 4G/5G simultáneamente depende del teléfono. Spotify puede impedir que Android capture su audio; el tono de prueba permite distinguirlo de un problema de conexión.",13,MUTED,false),7);
+    add(root,button("Configuración de Wi-Fi",false,()->startActivity(new Intent(Settings.ACTION_WIFI_SETTINGS))),15);
+    add(root,button("Configuración de ubicación",false,()->startActivity(new Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))),8);
   }
-  private void showHost(LinearLayout p) {
-    add(p,txt("Transmitir sonido",22,WHITE,true),0);
-    status=txt(HostService.active?hostStatus:"Sin iniciar",14,GREEN,false);add(p,status,10);
-    add(p,txt("IP del anfitrión: "+localIp(),15,WHITE,true),16);
-    add(p,txt("PIN: "+(HostService.active?HostService.pin:"se genera al iniciar"),20,WHITE,true),10);
-    signal=txt("Señal capturada: "+HostService.level+"%   |   "+(HostService.connected?"Conectado":"Sin invitado"),13,MUTED,false);
-    add(p,signal,9);
-    add(p,action(HostService.active?"Transmisión iniciada":"Iniciar transmisión",true,()->{
-      if(!HostService.active) requestProjection();else toast("Ya está activo");
-    }),18);
-    add(p,action("Abrir Spotify",false,this::openSpotify),10);
-    add(p,action("Probar sonido de 1 segundo",false,()->{
-      if(!HostService.active){toast("Primero iniciá la transmisión");return;}
+  private void directHeader(LinearLayout card){
+    add(card,text("CONEXIÓN DIRECTA · SIN RED EXTERNA",12,GREEN,true),0);
+    directStatus=text(directMessage,14,MUTED,false);
+    add(card,directStatus,9);
+    if(!direct.supported())add(card,text("Wi-Fi Direct no está disponible en este dispositivo.",13,0xffffb86b,false),10);
+  }
+  private void hostUi(LinearLayout card){
+    add(card,text("Compartir audio",22,WHITE,true),0);
+    add(card,text("1 · Crear grupo Wi-Fi Direct",14,MUTED,true),16);
+    directHeader(card);
+    add(card,button("Crear conexión cercana",true,()->withDirectPermission(()->direct.createHostGroup())),14);
+    add(card,button("Cerrar grupo Wi-Fi Direct",false,()->withDirectPermission(()->{
+      direct.removeGroup();groupOwnerReady=false;stopService(new Intent(this,HostService.class));
+    })),8);
+    add(card,text("2 · Activar transmisión de audio",14,MUTED,true),20);
+    status=text(HostService.active?hostStatus:"Captura todavía desactivada",14,GREEN,false);add(card,status,7);
+    String code=HostService.pin.isEmpty()?pendingPin:HostService.pin;
+    add(card,text("PIN de sesión: "+(code.isEmpty()?"se genera al iniciar audio":code),18,WHITE,true),10);
+    signal=text("Señal: "+HostService.level+"% · "+(HostService.connected?"Parlante enlazado":"Sin invitado"),13,MUTED,false);
+    add(card,signal,8);
+    add(card,button("Iniciar captura de audio",true,()->{
+      if(!groupOwnerReady){toast("Creá primero el grupo Wi-Fi Direct");return;}
+      if(!HostService.active)requestProjection();
+      else toast("La captura ya está encendida");
+    }),14);
+    add(card,button("Probar tono de 1 segundo",false,()->{
+      if(!HostService.active){toast("Primero iniciá la captura");return;}
       startService(new Intent(this,HostService.class).setAction(HostService.TEST));
-    }),10);
-    add(p,action("Detener transmisión",false,()->{
-      stopService(new Intent(this,HostService.class));hostStatus="Transmisión detenida";render();
-    }),10);
-    add(p,txt("Conectá ambos teléfonos a la misma Wi-Fi, iniciá la transmisión y copiá la IP y el PIN en el segundo.",13,MUTED,false),14);
+    }),8);
+    add(card,button("Abrir Spotify",false,this::openSpotify),8);
+    add(card,button("Detener audio",false,()->{
+      stopService(new Intent(this,HostService.class));hostStatus="Captura detenida";render();
+    }),8);
+    add(card,text("El segundo teléfono debe elegir el nombre de este Android y escribir el PIN mostrado aquí. Si Android pregunta si aceptás la conexión Wi-Fi Direct, confirmala.",13,MUTED,false),14);
   }
-  private void showSpeaker(LinearLayout p) {
-    add(p,txt("Usar como parlante",22,WHITE,true),0);
-    status=txt(SpeakerService.active?speakerStatus:"Sin conexión",14,GREEN,false);add(p,status,10);
-    ipField=field("IP del anfitrión (192.168.x.x)",getPreferences(0).getString("hostIp",""),InputType.TYPE_CLASS_TEXT);
-    add(p,ipField,16);
-    pinField=field("PIN de 6 dígitos","",InputType.TYPE_CLASS_NUMBER);
+  private void speakerUi(LinearLayout card){
+    add(card,text("Parlante inalámbrico",22,WHITE,true),0);
+    add(card,text("1 · Descubrir anfitrión",14,MUTED,true),16);
+    directHeader(card);
+    if(!locationEnabled())add(card,text("Activá Ubicación en los ajustes para que Android descubra teléfonos cercanos.",13,0xffffb86b,false),10);
+    add(card,button("Buscar celulares cercanos",true,()->withDirectPermission(()->{
+      if(!locationEnabled()){toast("Activá Ubicación para buscar dispositivos");return;}
+      direct.scan();
+    })),14);
+    peerBox=new LinearLayout(this);peerBox.setOrientation(1);
+    add(card,peerBox,12);fillPeers();
+    add(card,text("2 · PIN que aparece en el anfitrión",14,MUTED,true),20);
+    pinField=edit("PIN de 6 dígitos",pendingSpeakerPin,InputType.TYPE_CLASS_NUMBER);
     pinField.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(6)});
-    add(p,pinField,10);
-    add(p,txt("Búfer de recepción (más alto = menos cortes)",13,MUTED,false),13);
-    delay=new SeekBar(this);delay.setMax(22);delay.setProgress(3);add(p,delay,6);
-    add(p,action("Conectar parlante",true,()->{
-      String ip=ipField.getText().toString().trim(),pin=pinField.getText().toString().trim();
-      try {
-        InetAddress addr=InetAddress.getByName(ip);
-        if(!(addr instanceof Inet4Address)||!addr.isSiteLocalAddress())throw new Exception();
-      }catch(Exception e){toast("Necesitás una IP IPv4 privada de Wi-Fi");return;}
-      if(!pin.matches("[0-9]{6}")){toast("PIN incorrecto");return;}
-      if(SpeakerService.active){toast("Desconectá el parlante anterior");return;}
-      getPreferences(0).edit().putString("hostIp",ip).apply();
-      Intent i=new Intent(this,SpeakerService.class).setAction(SpeakerService.START);
-      i.putExtra("ip",ip);i.putExtra("pin",pin);i.putExtra("buffer",60+delay.getProgress()*20);
-      try{startForegroundService(i);speakerStatus="Conectando a "+ip;status.setText(speakerStatus);}
-      catch(Exception ex){toast("No se pudo iniciar: "+ex.getMessage());}
-    }),17);
-    add(p,action("Desconectar",false,()->{
-      stopService(new Intent(this,SpeakerService.class));speakerStatus="Desconectado";render();
-    }),10);
-    add(p,txt("Este celular no necesita Spotify ni una segunda cuenta Premium.",13,MUTED,false),15);
+    add(card,pinField,10);
+    add(card,text("Búfer de recepción (menos cortes, mayor retardo)",12,MUTED,false),12);
+    delay=new SeekBar(this);delay.setMax(22);delay.setProgress(Math.max(0,(pendingBufferMs-60)/20));add(card,delay,5);
+    status=text(SpeakerService.active?speakerStatus:"Sin audio",14,GREEN,false);add(card,status,14);
+    add(card,button("Desconectar parlante",false,()->{
+      pendingSpeakerPin="";connectionPending=false;
+      stopService(new Intent(this,SpeakerService.class));
+      withDirectPermission(()->direct.removeGroup());
+      speakerStatus="Desconectado";render();
+    }),13);
+    add(card,text("No uses IP manual. Cuando aparezca el anfitrión, escribí su PIN y tocá su nombre para conectarte automáticamente.",13,MUTED,false),13);
   }
-  private void requestProjection() {
+  private void fillPeers(){
+    if(peerBox==null)return;
+    peerBox.removeAllViews();
+    if(nearby.isEmpty()){
+      add(peerBox,text("Aún no aparecen dispositivos. Tocá Buscar y acercá ambos teléfonos.",13,MUTED,false),0);return;
+    }
+    for(WifiP2pDevice device:nearby){
+      String name=DirectLink.displayName(device);
+      String state=device.status==WifiP2pDevice.AVAILABLE?"Disponible":device.status==WifiP2pDevice.CONNECTED?"Conectado":"Cercano";
+      add(peerBox,button(name+"  ·  "+state,false,()->selectPeer(device)),7);
+    }
+  }
+  private void selectPeer(WifiP2pDevice device){
+    String pin=pinField==null?"":pinField.getText().toString().trim();
+    if(!pin.matches("[0-9]{6}")){toast("Primero ingresá el PIN de seis dígitos del anfitrión");return;}
+    pendingSpeakerPin=pin;
+    pendingBufferMs=delay==null?120:60+delay.getProgress()*20;
+    connectionPending=true;
+    withDirectPermission(()->direct.connectTo(device));
+  }
+  @Override public void onPeers(List<WifiP2pDevice> peers){
+    nearby=new ArrayList<>(peers);fillPeers();
+  }
+  @Override public void onStatus(String message){
+    directMessage=message;
+    if(directStatus!=null)directStatus.setText(message);
+  }
+  @Override public void onConnected(InetAddress owner,boolean amOwner){
+    if(owner==null)return;
+    if(amOwner){
+      groupOwnerReady=true;
+      onStatus("Grupo Wi-Fi Direct activo. Listo para recibir al parlante.");
+    }else{
+      onStatus("Enlace directo establecido con "+owner.getHostAddress());
+      if(connectionPending&&!SpeakerService.active && pendingSpeakerPin.matches("[0-9]{6}")){
+        connectionPending=false;
+        Intent i=new Intent(this,SpeakerService.class).setAction(SpeakerService.START);
+        i.putExtra("ip",owner.getHostAddress());
+        i.putExtra("pin",pendingSpeakerPin);
+        i.putExtra("buffer",pendingBufferMs);
+        try{startForegroundService(i);speakerStatus="Conectando sonido por Wi-Fi Direct...";if(status!=null)status.setText(speakerStatus);}
+        catch(Exception e){onStatus("Error al iniciar audio: "+e.getMessage());}
+      }
+    }
+  }
+  private boolean allowedDirect(){
+    String permission=Build.VERSION.SDK_INT>=33?Manifest.permission.NEARBY_WIFI_DEVICES:Manifest.permission.ACCESS_FINE_LOCATION;
+    return checkSelfPermission(permission)==PackageManager.PERMISSION_GRANTED;
+  }
+  private void withDirectPermission(Runnable task){
+    if(!direct.supported()){toast("Este Android no soporta Wi-Fi Direct");return;}
+    if(allowedDirect()){task.run();return;}
+    pendingPermissionAction=task;
+    requestPermissions(new String[]{Build.VERSION.SDK_INT>=33?Manifest.permission.NEARBY_WIFI_DEVICES:Manifest.permission.ACCESS_FINE_LOCATION},REQ_DIRECT);
+  }
+  private boolean locationEnabled(){
+    LocationManager lm=getSystemService(LocationManager.class);
+    return lm!=null&&lm.isLocationEnabled();
+  }
+  private void requestProjection(){
     if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED){
-      requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},AUDIO_REQUEST);return;
+      requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},REQ_AUDIO);return;
     }
     pendingPin=String.format(Locale.US,"%06d",new SecureRandom().nextInt(1000000));
-    try{
-      MediaProjectionManager m=getSystemService(MediaProjectionManager.class);
-      startActivityForResult(m.createScreenCaptureIntent(),PROJECTION_REQUEST);
-    }catch(Exception e){toast("Permiso no disponible: "+e.getMessage());}
+    MediaProjectionManager m=getSystemService(MediaProjectionManager.class);
+    if(m==null){toast("Captura de audio no disponible");return;}
+    try{startActivityForResult(m.createScreenCaptureIntent(),REQ_PROJECTION);}
+    catch(Exception e){toast("No se pudo solicitar captura: "+e.getMessage());}
   }
-  @Override public void onRequestPermissionsResult(int requestCode,String[] perms,int[] grants){
-    super.onRequestPermissionsResult(requestCode,perms,grants);
-    if(requestCode==AUDIO_REQUEST){
-      if(grants.length>0 && grants[0]==PackageManager.PERMISSION_GRANTED)requestProjection();
-      else toast("Se necesita el permiso de captura de audio");
+  @Override public void onRequestPermissionsResult(int request,String[] names,int[] grant){
+    super.onRequestPermissionsResult(request,names,grant);
+    boolean yes=grant.length>0&&grant[0]==PackageManager.PERMISSION_GRANTED;
+    if(request==REQ_AUDIO){
+      if(yes)requestProjection();else toast("Se necesita permiso de grabar audio");
+    }else if(request==REQ_DIRECT){
+      Runnable task=pendingPermissionAction;pendingPermissionAction=null;
+      if(yes&&task!=null)task.run();else toast("Autorizá dispositivos cercanos para Wi-Fi Direct");
     }
   }
-  @Override protected void onActivityResult(int code,int result,Intent data){
-    super.onActivityResult(code,result,data);
-    if(code==PROJECTION_REQUEST){
+  @Override protected void onActivityResult(int request,int result,Intent data){
+    super.onActivityResult(request,result,data);
+    if(request==REQ_PROJECTION){
       if(result!=RESULT_OK||data==null){toast("Captura cancelada");return;}
       Intent i=new Intent(this,HostService.class).setAction(HostService.START);
       i.putExtra("permissionResult",result);i.putExtra("consent",data);i.putExtra("pin",pendingPin);
@@ -177,20 +267,5 @@ public final class MainActivity extends Activity {
     if(i==null)i=new Intent(Intent.ACTION_VIEW,android.net.Uri.parse("https://open.spotify.com"));
     try{startActivity(i);}catch(Exception e){toast("No se pudo abrir Spotify");}
   }
-  private String localIp(){
-    try{
-      Enumeration<NetworkInterface> it=NetworkInterface.getNetworkInterfaces();
-      while(it.hasMoreElements()){
-        NetworkInterface n=it.nextElement();
-        if(!n.isUp()||n.isLoopback())continue;
-        Enumeration<InetAddress> addr=n.getInetAddresses();
-        while(addr.hasMoreElements()){
-          InetAddress a=addr.nextElement();
-          if(a instanceof Inet4Address&&a.isSiteLocalAddress()&&n.getName().startsWith("wlan"))return a.getHostAddress();
-        }
-      }
-    }catch(Exception ignored){}
-    return "No disponible · conectá Wi-Fi";
-  }
-  private void toast(String msg){Toast.makeText(this,msg,Toast.LENGTH_LONG).show();}
+  private void toast(String s){Toast.makeText(this,s,Toast.LENGTH_LONG).show();}
 }

@@ -1,15 +1,31 @@
-# DuoLink Audio · Android Wi-Fi speaker
+# DuoLink Direct · 0.5.0 beta
 
-Este proyecto compila la app Android en GitHub Actions. Un Android anfitrión captura audio interno cuya aplicación de origen permite la captura oficial de Android (MediaProjection + AudioPlaybackCapture, Android 10+), y lo transmite por Wi-Fi LAN al Android parlante usando PCM 48 kHz estéreo.
+Aplicación Android 10+ para usar un segundo celular como parlante de audio interno capturable mediante **Wi-Fi Direct (P2P)**, sin conectarse a un router y sin solicitar una IP manual.
 
-## Instalación
+## Usar en un auto o transporte
 
-Descargá el artifact `DuoLink-Audio-0.4.1-beta-apk` del workflow `DuoLink Audio · APK` en Actions, extraé el archivo `app-debug.apk` e instalalo en ambos teléfonos.
+1. Instalá el APK en los dos teléfonos. Activá **Wi-Fi** en ambos. No hace falta tener una red Wi-Fi disponible ni Internet para la transmisión.
+2. En el **anfitrión** tocá **Crear conexión cercana** y aceptá los permisos de dispositivos cercanos. Se crea un grupo P2P con el anfitrión como dueño. Luego **Iniciar captura de audio**, confirmá el permiso del sistema y copiá el PIN.
+3. En el teléfono **parlante**, habilitá Ubicación en Android (para búsqueda P2P) y tocá **Buscar celulares cercanos**. Al ver el nombre del anfitrión, ingresá su PIN de seis dígitos y tocá su nombre. Aceptá los avisos de conexión del sistema que aparezcan.
+4. Reproducí el **tono de prueba** en el anfitrión para confirmar que ambos dispositivos transmiten. Abrí Spotify para verificar si esa versión permite capturar el audio.
+5. Si Spotify impide la captura, el tono se transmitirá pero la música no. Esto es una limitación del reproductor de origen, no de Wi-Fi Direct.
 
-Los dos deben estar conectados a la misma Wi-Fi. En el primero elegí Anfitrión, autorizá la captura y copiá la IP/PIN. En el segundo elegí Parlante, ingresá IP/PIN y conectá. Probá primero el tono de prueba, después Spotify en el anfitrión.
+**La app no usa Spotify Jam ni requiere una segunda cuenta Premium.** Para viajes, es mejor probar canciones de Spotify descargadas en el anfitrión. El uso simultáneo de datos móviles para música en streaming y Wi-Fi Direct depende del modelo y la implementación del fabricante. El audio de Spotify puede estar protegido y dar silencio aun con una conexión estable.
 
-## Límite de compatibilidad
+## Implementación
 
-**Spotify puede bloquear la captura del audio interno** por su política de protección de contenidos. El APK no modifica ni elude Spotify, ni garantiza captura del audio de Spotify. Si el indicador muestra 0 mientras Spotify reproduce, Android probablemente no entrega su audio a la app. El tono sirve para diagnosticar el transporte. No usa una segunda cuenta Premium ni Jam. La captura original local y el parlante pueden no estar perfectamente sincronizados, y existir eco entre ambos teléfonos.
+- `WifiP2pManager.createGroup`: el anfitrión crea la red directa.
+- `WifiP2pManager.discoverPeers/connect`: el parlante encuentra y se conecta a un Android cercano.
+- `requestConnectionInfo`: dirección IP del dueño del grupo asignada automáticamente por Wi-Fi Direct.
+- `AudioPlaybackCapture/MediaProjection`: captura **solo** audio interno de apps que autorizan la función oficial de Android.
+- TCP local, PCM 48 kHz estéreo, PIN de sesión de 6 dígitos y búfer seleccionable.
 
-**Seguridad**: PIN de sesión de seis dígitos; transporte PCM no cifrado. Utilizar solamente Wi-Fi de confianza. Wi-Fi Direct y sincronización absoluta no están implementados en esta versión.
+### Advertencias
+
+- Sin garantía de funcionamiento en todos los fabricantes/ROM. Wi-Fi Direct puede estar limitado o deshabilitado.
+- El búfer introduce latencia en el parlante y puede producir eco frente al sonido local. No se promete sincronización perfecta de ambos altavoces.
+- La negociación P2P depende del sistema: algunos Android requieren aceptar una invitación o habilitar ubicación.
+- La captura Spotify puede estar bloqueada por la política DRM/captura de su aplicación.
+- Los datos PCM no llevan cifrado propio, pero Wi-Fi Direct negocia protección WPA2. El PIN autentica al cliente.
+- No probado físicamente en dos teléfonos. Compilación disponible mediante GitHub Actions.
+
